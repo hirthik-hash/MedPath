@@ -606,8 +606,17 @@ def ingest_patient_evidence(
         ).first()
         
         if existing:
+            updated = False
             if existing.evidence_state != estate:
                 existing.evidence_state = estate
+                updated = True
+            if existing.confidence != conf:
+                existing.confidence = conf
+                updated = True
+            if unit is not None and existing.unit != unit:
+                existing.unit = unit
+                updated = True
+            if updated:
                 db.commit()
                 db.refresh(existing)
             node_id_map[temp_key] = existing.id
@@ -675,6 +684,10 @@ def ingest_patient_evidence(
                 db.refresh(new_edge)
                 created_edges.append(new_edge)
             else:
+                if existing_edge.confidence != conf:
+                    existing_edge.confidence = conf
+                    db.commit()
+                    db.refresh(existing_edge)
                 created_edges.append(existing_edge)
 
                 

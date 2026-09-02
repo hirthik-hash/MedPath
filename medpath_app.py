@@ -19,6 +19,7 @@ import streamlit as st
 
 import json
 import os
+import re
 import uuid
 from datetime import datetime, date
 import requests as http_requests
@@ -196,29 +197,382 @@ def save_patient_record(patient_id, record, patients=None):
     save_db(PATIENTS_FILE, patients)
 
 
+def clean_atomic_name(text: str, max_words: int = 4) -> str:
+    """
+    Cleans a clinical finding or entity text to ensure it is atomic, title-cased,
+    and strictly concise (<= 3-4 words max).
+    """
+    if not text:
+        return "Clinical Finding"
+    # Split on em dash, en dash, colon, semicolon, parenthesis, or square brackets
+    cleaned = re.split(r'[—–:\(\[\{;]', str(text))[0].strip()
+    cleaned = re.sub(r'[\(\[\{].*?[\)\]\}]', '', cleaned).strip()
+    cleaned = re.sub(r'[:;,.]+$', '', cleaned).strip()
+    cleaned = re.sub(r'(?i)^(only|presence of|documented|the)\s+', '', cleaned).strip()
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+    words = cleaned.split()
+    if not words:
+        return "Clinical Finding"
+    if len(words) > max_words:
+        cleaned = " ".join(words[:max_words])
+    return cleaned.title()
+
+
+def normalize_confidence(conf_val, likelihood=None, is_not_tested=False, is_direct_lab=False, is_negative=False):
+    """
+    Calculates a realistic, varied confidence rating:
+    - NOT_YET_TESTED nodes (missing / recommended) -> 'Medium' or 'Low'
+    - Confirmed direct lab measurements with explicit values -> 'High'
+    - Qualitative / differential findings -> follows LLM assessment ('High', 'Medium', 'Low')
+    """
+    if is_not_tested:
+        return "Medium"
+
+    if conf_val is not None:
+        try:
+            val = float(conf_val)
+            if val > 1.0:
+                if val >= 85:
+                    return "High"
+                elif val >= 60:
+                    return "Medium"
+                else:
+                    return "Low"
+            else:
+                if val >= 0.85:
+                    return "High"
+                elif val >= 0.60:
+                    return "Medium"
+                else:
+                    return "Low"
+        except (ValueError, TypeError):
+            c_str = str(conf_val).strip()
+            if c_str.capitalize() in ["High", "Medium", "Low"]:
+                return c_str.capitalize()
+
+    if likelihood:
+        l_str = str(likelihood).strip().capitalize()
+        if l_str in ["High", "Medium", "Low"]:
+            return l_str
+
+    if is_direct_lab:
+        return "High"
+
+    return "Medium"
+
+
+def parse_atomic_findings(raw_ev, pattern=None, source_doc_id=None, source_doc_name=None):
+    """
+    Extracts atomic, discrete clinical findings from raw prose or n8n evidence strings.
+    Converts complex sentences with missing tests or compound findings into individual EvidenceNode dicts.
+    """
+    findings = []
+    text = str(raw_ev).strip()
+    if not text:
+        return findings
+
+    pat_conf = pattern.get("confidence") if isinstance(pattern, dict) else None
+    pat_like = pattern.get("likelihood") if isinstance(pattern, dict) else None
+
+    # Step 0: Semicolon split
+    clauses = [c.strip() for c in re.split(r';', text) if c.strip()]
+    if len(clauses) > 1:
+        for cl in clauses:
+            findings.extend(parse_atomic_findings(cl, pattern, source_doc_id, source_doc_name))
+        return findings
+
+    # Step 1: Document Reference Check
+    if any(w in text.lower() for w in [".pdf", ".docx", "report dated", "laboratory report"]):
+        doc_name = "CBC Report" if "cbc" in text.lower() else "Laboratory Report"
+        date_match = re.search(r'\d{1,2}\s+[A-Za-z]{3}\s+\d{4}', text)
+        val = date_match.group(0) if date_match else "Documented"
+        findings.append({
+            "name": doc_name,
+            "value": val,
+            "unit": None,
+            "evidence_type": "DOCUMENT",
+            "evidence_state": "PRESENT",
+            "confidence": normalize_confidence(pat_conf, pat_like)
+        })
+        return findings
+
+    # Step 2: Clinical Impression
+    if text.lower().startswith("impression:") or "clinical impression:" in text.lower():
+        clean = re.sub(r'(?i)^(impression|clinical impression):\s*', '', text)
+        clean = re.sub(r'\s*\([^)]*\)', '', clean)
+        sub_parts = [p.strip() for p in re.split(r'\bwith\b|\band\b|(?<!\d),(?!\d)', clean) if p.strip()]
+        for sp in sub_parts:
+            atomic_name = clean_atomic_name(sp, max_words=4)
+            findings.append({
+                "name": atomic_name,
+                "value": "Clinical Impression",
+                "unit": None,
+                "evidence_type": "DIAGNOSIS",
+                "evidence_state": "PRESENT",
+                "confidence": normalize_confidence(pat_conf, pat_like)
+            })
+        if findings:
+            return findings
+
+    # Step 3: Missing / Not Tested Tests in prose
+    if any(k in text.lower() for k in [
+        "not documented", "not tested", "not recorded", "not evaluated",
+        "no documented", "insufficient data", "not available"
+    ]):
+        clean_text = re.sub(r'\s*\([^)]*\)', '', text)
+        clean = re.sub(r'(?i)^(no documented|there is no documented|not documented|no|history of)\s+', '', clean_text)
+        clean = re.sub(r'(?i)\s+(are|is|were)\s+not\s+(documented|tested|recorded|evaluated).*$', '', clean)
+        clean = re.sub(r'(?i)\s+(in the record|in record|in medical record).*$', '', clean)
+        clean = re.sub(r'(?i)^only\s+', '', clean)
+
+        parts = [p.strip() for p in re.split(r'(?<!\d),(?!\d)|\band\b|\bor\b', clean) if p.strip()]
+        for p in parts:
+            if not p or len(p) < 2 or p.lower() in ["the", "a", "and", "or", "in", "value is present", "present"]:
+                continue
+            if "is present" in p.lower() or "present" in p.lower():
+                h_name = clean_atomic_name(p.replace("value is present", "").replace("is present", ""), max_words=3)
+                findings.append({
+                    "name": h_name,
+                    "value": "Present",
+                    "unit": None,
+                    "evidence_type": "LAB_RESULT",
+                    "evidence_state": "PRESENT",
+                    "confidence": normalize_confidence(pat_conf, pat_like)
+                })
+                continue
+
+            atomic_name = clean_atomic_name(p, max_words=4)
+            p_lower = p.lower()
+            if any(w in p_lower for w in ["indices", "count", "studies", "test", "hemoglobin", "lab", "panel", "serum", "trend", "rbc"]):
+                etype = "LAB_RESULT"
+            elif any(w in p_lower for w in ["symptom", "pain", "fever", "bleeding", "headache", "vital"]):
+                etype = "SYMPTOM"
+            elif any(w in p_lower for w in ["medication", "drug", "therapy"]):
+                etype = "MEDICATION"
+            else:
+                etype = "CLINICAL_NOTE"
+
+            findings.append({
+                "name": atomic_name,
+                "value": "Not Documented",
+                "unit": None,
+                "evidence_type": etype,
+                "evidence_state": "NOT_YET_TESTED",
+                "confidence": normalize_confidence(pat_conf, pat_like, is_not_tested=True)
+            })
+        if findings:
+            return findings
+
+    # Step 4: Qualitative Lab/Test (e.g. Dengue NS1 Antigen: POSITIVE)
+    qual_match = re.search(
+        r'([A-Za-z][A-Za-z0-9\s\-/]*?)\s*[:=]\s*(POSITIVE|NEGATIVE|REACTIVE|NON-REACTIVE|DETECTED|NOT DETECTED|NORMAL|LOW|HIGH)',
+        text,
+        re.IGNORECASE
+    )
+    if qual_match:
+        raw_name = qual_match.group(1).strip()
+        val = qual_match.group(2).strip().capitalize()
+        atomic_name = clean_atomic_name(raw_name, max_words=4)
+        state = "TESTED_NEGATIVE" if val.upper() in ["NEGATIVE", "NOT DETECTED", "NON-REACTIVE"] else "PRESENT"
+        findings.append({
+            "name": atomic_name,
+            "value": val,
+            "unit": None,
+            "evidence_type": "LAB_RESULT",
+            "evidence_state": state,
+            "confidence": normalize_confidence(pat_conf, pat_like, is_direct_lab=True)
+        })
+        return findings
+
+    # Step 5: Negative Symptoms / Findings
+    if any(k in text.lower() for k in [
+        "no chest pain", "no shortness of breath", "no parasites", "tested_negative",
+        "negative for", "absent", "denies", "denied"
+    ]):
+        neg_parts = [p.strip() for p in re.split(r'\band\b|(?<!\d),(?!\d)', text) if p.strip()]
+        for np in neg_parts:
+            np_lower = np.lower()
+            if "malaria" in np_lower:
+                findings.append({
+                    "name": "Malaria Smear",
+                    "value": "Negative",
+                    "unit": None,
+                    "evidence_type": "LAB_RESULT",
+                    "evidence_state": "TESTED_NEGATIVE",
+                    "confidence": normalize_confidence(pat_conf, pat_like, is_direct_lab=True)
+                })
+            elif "chest pain" in np_lower:
+                findings.append({
+                    "name": "Chest Pain",
+                    "value": "Absent",
+                    "unit": None,
+                    "evidence_type": "SYMPTOM",
+                    "evidence_state": "TESTED_NEGATIVE",
+                    "confidence": normalize_confidence(pat_conf, pat_like, is_negative=True)
+                })
+            elif "shortness of breath" in np_lower or "breath" in np_lower:
+                findings.append({
+                    "name": "Shortness Of Breath",
+                    "value": "Absent",
+                    "unit": None,
+                    "evidence_type": "SYMPTOM",
+                    "evidence_state": "TESTED_NEGATIVE",
+                    "confidence": normalize_confidence(pat_conf, pat_like, is_negative=True)
+                })
+            else:
+                np_clean = re.sub(r'(?i)^(no|denies|denied|negative for)\s+', '', np)
+                np_clean = re.sub(r'(?i)\s+(reported|seen|documented|present).*$', '', np_clean)
+                if np_clean:
+                    atomic_name = clean_atomic_name(np_clean, max_words=4)
+                    etype = "LAB_RESULT" if any(w in np_lower for w in ["smear", "antigen", "test", "parasite"]) else "SYMPTOM"
+                    findings.append({
+                        "name": atomic_name,
+                        "value": "Absent",
+                        "unit": None,
+                        "evidence_type": etype,
+                        "evidence_state": "TESTED_NEGATIVE",
+                        "confidence": normalize_confidence(pat_conf, pat_like, is_negative=True)
+                    })
+        if findings:
+            return findings
+
+    # Step 6: Quantitative Lab Results / Vitals
+    non_duration_text = re.sub(r'(?i)\s+for\s+\d+\s+days?', '', text)
+    multi_items = [item.strip() for item in re.split(r'\band\b|(?<!\d),(?!\d)', non_duration_text) if re.search(r'\d', item)]
+    if not multi_items:
+        multi_items = [text]
+
+    matched_quantitative = False
+    for item in multi_items:
+        lab_match = re.search(
+            r'([A-Za-z][A-Za-z0-9\s\-/]*?)\s*(?:is|was|measured|of)?\s*[:=]?\s+([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?(?:/[0-9]{1,3}(?:,[0-9]{3})*)?)\s*([a-zA-Z/%μuµLgdmgkgh\^]+(?:\s*\(.*?\))?)?',
+            item
+        )
+        if lab_match:
+            raw_name = lab_match.group(1).strip()
+            val = lab_match.group(2).strip()
+            unit = lab_match.group(3).strip() if lab_match.group(3) else None
+            if unit:
+                unit = re.sub(r'\s*\([^)]*\)', '', unit).strip()
+
+            if unit and unit.lower() in ["days", "day", "weeks", "week", "months", "years"]:
+                continue
+
+            raw_name = re.sub(r'(?i)^(high|low|mild|severe)\s+', '', raw_name)
+            raw_name = re.sub(r'(?i)\s+(with|for|setting|below|above).*$', '', raw_name)
+            raw_name = re.sub(r'(?i)^only\s+', '', raw_name)
+
+            atomic_name = clean_atomic_name(raw_name, max_words=4)
+            name_lower = atomic_name.lower()
+
+            if "fever" in name_lower or "temp" in name_lower:
+                etype = "SYMPTOM"
+            else:
+                etype = "LAB_RESULT"
+
+            findings.append({
+                "name": atomic_name,
+                "value": val,
+                "unit": unit,
+                "evidence_type": etype,
+                "evidence_state": "PRESENT",
+                "confidence": normalize_confidence(pat_conf, pat_like, is_direct_lab=True)
+            })
+            matched_quantitative = True
+
+    if matched_quantitative:
+        return findings
+
+    # Step 7: Symptoms
+    if any(s in text.lower() for s in ["fever", "headache", "pain", "fatigue", "aches", "cough", "nausea", "vomiting", "rash"]):
+        s_clean = re.sub(r'(?i)^chief complaint:\s*', '', text)
+        s_parts = re.split(r'(?i)\s+with\s+|(?<!\d),(?!\d)|\band\b', s_clean)
+        for sp in s_parts:
+            sp = sp.strip()
+            if not sp or sp.lower() in ["the", "a", "in", "for", "approximately"]:
+                continue
+            temp_match = re.search(r'(?i)fever.*?([0-9]+\.?[0-9]*)\s*([cCfF])', sp)
+            if temp_match:
+                findings.append({
+                    "name": "Fever",
+                    "value": temp_match.group(1),
+                    "unit": temp_match.group(2).upper(),
+                    "evidence_type": "SYMPTOM",
+                    "evidence_state": "PRESENT",
+                    "confidence": normalize_confidence(pat_conf, pat_like, is_direct_lab=True)
+                })
+            else:
+                dur_match = re.search(r'(?i)(\d+)\s+days?', sp)
+                val_str = f"Present ({dur_match.group(0)})" if dur_match else "Present"
+                sp_clean = re.sub(r'(?i)\s+(for\s+approximately\s+\d+\s+days?|for\s+\d+\s+days?).*$', '', sp)
+                sp_clean = re.sub(r'(?i)\s+(in the setting of|setting).*$', '', sp_clean)
+                atomic_name = clean_atomic_name(sp_clean, max_words=4)
+                findings.append({
+                    "name": atomic_name,
+                    "value": val_str,
+                    "unit": None,
+                    "evidence_type": "SYMPTOM",
+                    "evidence_state": "PRESENT",
+                    "confidence": normalize_confidence(pat_conf, pat_like)
+                })
+        if findings:
+            return findings
+
+    # Step 8: Fallback
+    atomic_name = clean_atomic_name(text, max_words=4)
+    findings.append({
+        "name": atomic_name,
+        "value": "Documented",
+        "unit": None,
+        "evidence_type": "CLINICAL_NOTE",
+        "evidence_state": "PRESENT",
+        "confidence": normalize_confidence(pat_conf, pat_like)
+    })
+    return findings
+
+
 def sync_patient_evidence_to_backend(patient_id, record, n8n_result=None, source_doc_id=None, source_doc_name=None):
+    """
+    Syncs structured clinical findings, symptoms, laboratory test results, medications,
+    documents, timeline events, and n8n AI analysis into the Clinical Evidence Graph.
+    Atomizes all evidence into concise nodes with discrete values, units, states, and
+    calibrated confidence levels.
+    """
     if not patient_id or not record:
         return
 
     nodes = []
     edges = []
+    seen_nodes = set()
+
+    def add_node(node_dict):
+        key = (node_dict["evidence_type"], node_dict["name"], str(node_dict.get("value")), node_dict.get("evidence_state"))
+        if key not in seen_nodes:
+            seen_nodes.add(key)
+            nodes.append(node_dict)
+            return node_dict["id"]
+        for n in nodes:
+            if (n["evidence_type"], n["name"], str(n.get("value")), n.get("evidence_state")) == key:
+                return n["id"]
+        return node_dict["id"]
 
     # 1. Symptoms
     for sym in record.get("symptoms", []):
         if isinstance(sym, dict):
-            sname = sym.get("name") or sym.get("symptom") or "Symptom"
-            sval = sym.get("severity") or sym.get("status")
+            sname = clean_atomic_name(sym.get("name") or sym.get("symptom") or "Symptom", max_words=4)
+            sval = sym.get("severity") or sym.get("status") or "Present"
             sdate = sym.get("onsetDate") or sym.get("date")
         else:
-            sname = str(sym)
-            sval = None
+            sname = clean_atomic_name(str(sym), max_words=4)
+            sval = "Present"
             sdate = None
 
-        nodes.append({
-            "id": f"sym_{sname}",
+        add_node({
+            "id": f"sym_{sname}_{sval}",
             "evidence_type": "SYMPTOM",
             "name": sname,
             "value": sval,
+            "unit": None,
             "date": sdate,
             "source_type": "MANUAL_ENTRY",
             "confidence": "High",
@@ -229,18 +583,18 @@ def sync_patient_evidence_to_backend(patient_id, record, n8n_result=None, source
     # 2. Labs
     for lab in record.get("labs", []):
         if isinstance(lab, dict):
-            lname = lab.get("name") or lab.get("test") or "Lab Test"
-            lval = lab.get("value") or lab.get("result")
+            lname = clean_atomic_name(lab.get("name") or lab.get("test") or "Lab Test", max_words=4)
+            lval = str(lab.get("value") or lab.get("result") or "")
             lunit = lab.get("unit")
             ldate = lab.get("date")
         else:
-            lname = str(lab)
+            lname = clean_atomic_name(str(lab), max_words=4)
             lval = None
             lunit = None
             ldate = None
 
-        nodes.append({
-            "id": f"lab_{lname}",
+        add_node({
+            "id": f"lab_{lname}_{lval}",
             "evidence_type": "LAB_RESULT",
             "name": lname,
             "value": lval,
@@ -257,19 +611,20 @@ def sync_patient_evidence_to_backend(patient_id, record, n8n_result=None, source
     # 3. Medications
     for med in record.get("medications", []):
         if isinstance(med, dict):
-            mname = med.get("name") or med.get("medication") or "Medication"
+            mname = clean_atomic_name(med.get("name") or med.get("medication") or "Medication", max_words=4)
             mval = med.get("dosage") or med.get("frequency")
             mdate = med.get("startDate") or med.get("date")
         else:
-            mname = str(med)
+            mname = clean_atomic_name(str(med), max_words=4)
             mval = None
             mdate = None
 
-        nodes.append({
-            "id": f"med_{mname}",
+        add_node({
+            "id": f"med_{mname}_{mval}",
             "evidence_type": "MEDICATION",
             "name": mname,
             "value": mval,
+            "unit": None,
             "date": mdate,
             "source_type": "MANUAL_ENTRY",
             "confidence": "High",
@@ -280,15 +635,16 @@ def sync_patient_evidence_to_backend(patient_id, record, n8n_result=None, source
     # 4. Documents
     for doc in record.get("documents", []):
         if isinstance(doc, dict):
-            dname = doc.get("name") or "Medical Document"
+            dname = clean_atomic_name(doc.get("name") or "Medical Document", max_words=4)
             did = doc.get("id")
             ddate = doc.get("uploadedAt")
 
-            nodes.append({
+            add_node({
                 "id": f"doc_{did or dname}",
                 "evidence_type": "DOCUMENT",
                 "name": dname,
                 "value": doc.get("type", "PDF"),
+                "unit": None,
                 "date": ddate,
                 "source_document_id": did,
                 "source_document_name": dname,
@@ -301,45 +657,109 @@ def sync_patient_evidence_to_backend(patient_id, record, n8n_result=None, source
     # 5. Timeline Events
     for evt in record.get("timeline", []):
         if isinstance(evt, dict):
-            ename = evt.get("title") or evt.get("description") or "Timeline Event"
+            raw_title = evt.get("title") or ""
+            raw_desc = evt.get("description") or ""
             edate = evt.get("date")
-            nodes.append({
-                "id": f"evt_{ename}",
+            raw_combined = raw_title or raw_desc or "Timeline Event"
+
+            if "Evidence:" in raw_combined:
+                parts = raw_combined.split("Evidence:", 1)
+                event_name_raw = parts[0].strip()
+                embedded_ev = parts[1].strip()
+            elif "evidence:" in raw_combined:
+                parts = raw_combined.split("evidence:", 1)
+                event_name_raw = parts[0].strip()
+                embedded_ev = parts[1].strip()
+            else:
+                event_name_raw = raw_combined
+                embedded_ev = evt.get("evidence")
+
+            if "uploaded medical document:" in event_name_raw.lower():
+                doc_filename = event_name_raw.lower().split("uploaded medical document:")[-1].strip()
+                ename = "Document Uploaded"
+                eval_val = doc_filename or "Document Upload"
+            else:
+                ename = clean_atomic_name(event_name_raw, max_words=4)
+                eval_val = str(evt.get("type") or "Timeline Event")
+
+            evt_node_id = f"evt_{ename}_{edate or ''}"
+            actual_evt_id = add_node({
+                "id": evt_node_id,
                 "evidence_type": "TIMELINE_EVENT",
                 "name": ename,
+                "value": eval_val,
+                "unit": None,
                 "date": edate,
-                "source_type": "MANUAL_ENTRY",
+                "source_type": "MANUAL_ENTRY" if evt.get("source") != "ai" else "N8N_AI_ANALYSIS",
                 "confidence": "High",
                 "verification_status": "Confirmed",
                 "evidence_state": "PRESENT"
             })
 
+            # If timeline event contains embedded evidence, parse it into atomic finding nodes
+            if embedded_ev and isinstance(embedded_ev, str) and len(embedded_ev.strip()) > 2:
+                embedded_findings = parse_atomic_findings(embedded_ev, source_doc_id=source_doc_id, source_doc_name=source_doc_name)
+                for f in embedded_findings:
+                    ev_node_id = f"ev_{f['name']}_{f.get('value')}_{f.get('evidence_state')}"
+                    actual_ev_id = add_node({
+                        "id": ev_node_id,
+                        "evidence_type": f["evidence_type"],
+                        "name": f["name"],
+                        "value": f["value"],
+                        "unit": f.get("unit"),
+                        "date": edate,
+                        "source_document_id": source_doc_id,
+                        "source_document_name": source_doc_name,
+                        "source_type": "DOCUMENT_EXTRACT" if source_doc_name else "N8N_AI_ANALYSIS",
+                        "confidence": f["confidence"],
+                        "verification_status": "Confirmed",
+                        "evidence_state": f["evidence_state"]
+                    })
+                    edges.append({
+                        "source_node_id": actual_ev_id,
+                        "target_node_id": actual_evt_id,
+                        "relationship_type": "DERIVED_FROM" if f["evidence_state"] == "PRESENT" else "ASSOCIATED_WITH",
+                        "confidence": f["confidence"]
+                    })
+
     # 6. Structured n8n AI Analysis
+    n8n_dict_list = []
     if isinstance(n8n_result, dict):
-        n8n_dict = n8n_result
-        if isinstance(n8n_result.get("text"), str) and n8n_result.get("text").strip().startswith("{"):
+        n8n_dict_list.append((n8n_result, source_doc_id, source_doc_name))
+    else:
+        for doc in record.get("documents", []):
+            if isinstance(doc, dict) and isinstance(doc.get("analysis_data"), dict):
+                n8n_dict_list.append((doc["analysis_data"], doc.get("id"), doc.get("name")))
+
+    for n8n_item, s_id, s_name in n8n_dict_list:
+        n8n_dict = n8n_item
+        if isinstance(n8n_item.get("text"), str) and n8n_item.get("text").strip().startswith("{"):
             try:
-                parsed_text = json.loads(n8n_result["text"])
+                parsed_text = json.loads(n8n_item["text"])
                 if isinstance(parsed_text, dict):
                     n8n_dict = parsed_text
             except Exception:
                 pass
 
-        patterns = n8n_dict.get("patterns", [])
+        patterns = n8n_dict.get("patterns", []) or n8n_dict.get("clinical_patterns", [])
         if isinstance(patterns, list):
             for pat in patterns:
                 if isinstance(pat, dict):
-                    pname = pat.get("name") or "Clinical Pattern"
-                    pnode_id = f"diag_{pname}"
-                    nodes.append({
+                    raw_pname = pat.get("name") or "Clinical Pattern"
+                    atomic_pname = clean_atomic_name(raw_pname, max_words=4)
+                    pat_conf = normalize_confidence(pat.get("confidence"), pat.get("likelihood"))
+                    pnode_id = f"diag_{atomic_pname}"
+
+                    actual_pnode_id = add_node({
                         "id": pnode_id,
                         "evidence_type": "DIAGNOSIS",
-                        "name": pname,
+                        "name": atomic_pname,
                         "value": str(pat.get("description") or pat.get("likelihood") or "Pattern Detected"),
-                        "source_document_id": source_doc_id,
-                        "source_document_name": source_doc_name,
+                        "unit": None,
+                        "source_document_id": s_id,
+                        "source_document_name": s_name,
                         "source_type": "N8N_AI_ANALYSIS",
-                        "confidence": str(pat.get("confidence", "High")),
+                        "confidence": pat_conf,
                         "verification_status": "Pending",
                         "evidence_state": "PRESENT"
                     })
@@ -347,53 +767,55 @@ def sync_patient_evidence_to_backend(patient_id, record, n8n_result=None, source
                     ev_list = pat.get("evidence", [])
                     if isinstance(ev_list, list):
                         for ev in ev_list:
-                            ev_name = str(ev)
-                            ev_id = f"ev_{ev_name}"
-                            ev_lower = ev_name.lower()
+                            findings = parse_atomic_findings(ev, pattern=pat, source_doc_id=s_id, source_doc_name=s_name)
+                            for f in findings:
+                                ev_node_id = f"ev_{f['name']}_{f.get('value')}_{f.get('evidence_state')}"
+                                actual_ev_id = add_node({
+                                    "id": ev_node_id,
+                                    "evidence_type": f["evidence_type"],
+                                    "name": f["name"],
+                                    "value": f["value"],
+                                    "unit": f.get("unit"),
+                                    "source_document_id": s_id,
+                                    "source_document_name": s_name,
+                                    "source_type": "N8N_AI_ANALYSIS",
+                                    "confidence": f["confidence"],
+                                    "verification_status": "Confirmed",
+                                    "evidence_state": f["evidence_state"]
+                                })
 
-                            # Determine state: TESTED_NEGATIVE vs PRESENT
-                            if any(neg in ev_lower for neg in ["negative", "normal", "tested_negative", "no parasites", "absent", "clear", "denied"]):
-                                ev_state = "TESTED_NEGATIVE"
-                            else:
-                                ev_state = "PRESENT"
+                                if f["evidence_state"] == "NOT_YET_TESTED":
+                                    rel_type = "INDICATES"
+                                elif f["evidence_state"] == "TESTED_NEGATIVE":
+                                    rel_type = "CONTRADICTS" if "unlikely" not in raw_pname.lower() and "ruled out" not in raw_pname.lower() else "SUPPORTS"
+                                else:
+                                    rel_type = "CONTRADICTS" if "unlikely" in raw_pname.lower() or "ruled out" in raw_pname.lower() else "SUPPORTS"
 
-                            # Determine relationship: CONTRADICTS vs SUPPORTS
-                            if "unlikely" in pname.lower() or "ruled out" in pname.lower():
-                                rel_type = "CONTRADICTS"
-                            else:
-                                rel_type = "SUPPORTS"
+                                edges.append({
+                                    "source_node_id": actual_ev_id,
+                                    "target_node_id": actual_pnode_id,
+                                    "relationship_type": rel_type,
+                                    "confidence": f["confidence"]
+                                })
 
-                            nodes.append({
-                                "id": ev_id,
-                                "evidence_type": "SYMPTOM" if any(s in ev_lower for s in ["fever", "pain", "headache", "cough", "ache"]) else "LAB_RESULT",
-                                "name": ev_name,
-                                "source_document_id": source_doc_id,
-                                "source_document_name": source_doc_name,
-                                "source_type": "N8N_AI_ANALYSIS",
-                                "confidence": "High",
-                                "verification_status": "Confirmed",
-                                "evidence_state": ev_state
-                            })
-                            edges.append({
-                                "source_node_id": ev_id,
-                                "target_node_id": pnode_id,
-                                "relationship_type": rel_type,
-                                "confidence": "High"
-                            })
-
+        # Next best test
         next_test = n8n_dict.get("next_best_test")
         if next_test:
-            tname = str(next_test) if isinstance(next_test, str) else next_test.get("name", "Recommended Test") if isinstance(next_test, dict) else "Recommended Test"
-            nodes.append({
-                "id": f"test_{tname}",
+            tname = next_test if isinstance(next_test, str) else next_test.get("name", "Recommended Test") if isinstance(next_test, dict) else "Recommended Test"
+            atomic_tname = clean_atomic_name(tname, max_words=4)
+            add_node({
+                "id": f"test_{atomic_tname}",
                 "evidence_type": "LAB_RESULT",
-                "name": tname,
+                "name": atomic_tname,
+                "value": "Recommended Test",
+                "unit": None,
+                "source_document_id": s_id,
+                "source_document_name": s_name,
                 "source_type": "N8N_AI_ANALYSIS",
                 "confidence": "Medium",
                 "verification_status": "Pending",
                 "evidence_state": "NOT_YET_TESTED"
             })
-
 
     payload = {
         "nodes": nodes,
