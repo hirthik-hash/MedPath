@@ -34,6 +34,8 @@ from api_client import (
 )
 
 import graphviz
+from streamlit_agraph import agraph, Node, Edge, Config
+import streamlit.components.v1 as components
 
 # ==============================================================
 # CONFIG
@@ -200,13 +202,19 @@ def save_patient_record(patient_id, record, patients=None):
 def clean_atomic_name(text: str, max_words: int = 4) -> str:
     """
     Cleans a clinical finding or entity text to ensure it is atomic, title-cased,
-    and strictly concise (<= 3-4 words max).
+    and strictly concise (<= 3-4 words max). Strips all stray, unmatched brackets/parens.
     """
     if not text:
         return "Clinical Finding"
-    # Split on em dash, en dash, colon, semicolon, parenthesis, or square brackets
-    cleaned = re.split(r'[—–:\(\[\{;]', str(text))[0].strip()
+    cleaned = str(text).strip()
+    # Strip full enclosing outer parens/brackets first
+    cleaned = re.sub(r'^[\(\[\{](.*)[\)\]\}]$', r'\1', cleaned).strip()
+    # Remove interior parentheticals
     cleaned = re.sub(r'[\(\[\{].*?[\)\]\}]', '', cleaned).strip()
+    # Split on em dash, en dash, colon, semicolon
+    cleaned = re.split(r'[—–:;]', cleaned)[0].strip()
+    # Strip any stray unmatched brackets or parentheses anywhere
+    cleaned = re.sub(r'[\(\)\[\]\{\}]', '', cleaned).strip()
     cleaned = re.sub(r'[:;,.]+$', '', cleaned).strip()
     cleaned = re.sub(r'(?i)^(only|presence of|documented|the)\s+', '', cleaned).strip()
     cleaned = re.sub(r'\s+', ' ', cleaned)
@@ -531,6 +539,79 @@ def parse_atomic_findings(raw_ev, pattern=None, source_doc_id=None, source_doc_n
     return findings
 
 
+def determine_relationship_type(finding, raw_pattern_name, atomic_pattern_name):
+    """
+    Determines whether a finding SUPPORTS, CONTRADICTS, or INDICATES a diagnosis/pattern node.
+    - NOT_YET_TESTED finding -> INDICATES (identifies care gap / recommended test)
+    - Distinguishes stability vs rule-out vs active condition (with or without qualifying clauses)
+    - Evaluates consistency between finding state (PRESENT vs TESTED_NEGATIVE) and diagnosis intent.
+    """
+    state = finding.get("evidence_state", "PRESENT")
+    if state == "NOT_YET_TESTED":
+        return "INDICATES"
+
+    p_lower = (raw_pattern_name + " " + atomic_pattern_name).lower()
+    f_name_lower = finding.get("name", "").lower()
+    f_val_lower = str(finding.get("value", "")).lower()
+
+    # Rule out diagnosis vs stability vs active condition
+    is_rule_out = any(w in p_lower for w in ["ruled out", "less likely", "unlikely", "unconfirmed", "negative for"])
+    is_stability = any(w in p_lower for w in [
+        "hemodynamically stable", "hemodynamic stability", "clinically stable",
+        "respiratory stability", "vital signs normal", "unremarkable", "no acute compromise"
+    ]) or (("stable" in p_lower or "stability" in p_lower) and not any(w in p_lower for w in ["febrile", "fever", "infection", "anemia", "dengue", "thrombocytopenia"]))
+
+    is_active_illness = any(w in p_lower for w in [
+        "febrile", "fever", "infection", "syndrome", "anemia", "thrombocytopenia", "dengue", "malaria", "disease", "illness"
+    ])
+
+    is_negative_finding = (state == "TESTED_NEGATIVE") or any(w in f_val_lower for w in ["absent", "denied", "negative", "clear", "normal"])
+    is_symptom_or_sign = any(w in f_name_lower for w in [
+        "fever", "fatigue", "pain", "headache", "aches", "cough", "nausea", "vomiting", "rash", "weakness", "malaise"
+    ]) and not is_negative_finding
+
+    # 1. Pure stability patterns (e.g. Currently Hemodynamically Stable)
+    if is_stability and not is_active_illness:
+        if is_negative_finding or "normal" in f_val_lower:
+            return "SUPPORTS"
+        elif is_symptom_or_sign:
+            return "CONTRADICTS"
+        else:
+            return "SUPPORTS"
+
+    # 2. Rule-out patterns (e.g. Malaria Less Likely)
+    if is_rule_out:
+        if is_negative_finding:
+            return "SUPPORTS"
+        elif is_symptom_or_sign:
+            return "SUPPORTS" if "febrile" in p_lower else "CONTRADICTS"
+        else:
+            return "SUPPORTS"
+
+    # 3. Active illness / clinical pattern (e.g. Acute Febrile Illness Without Dengue, Anemia, Acute Dengue)
+    if is_active_illness:
+        if is_symptom_or_sign:
+            # Symptoms (Fever, Fatigue, Headache) SUPPORT an active illness/syndrome
+            return "SUPPORTS"
+        elif is_negative_finding:
+            # If pattern states 'without X' and the negative test is for X (e.g. without dengue / malaria), it SUPPORTS
+            if any(w in p_lower for w in ["without", "negative"]) and any(t in p_lower for t in f_name_lower.split() if len(t) > 3):
+                return "SUPPORTS"
+            # Direct refutation of core disease
+            p_terms = [t for t in p_lower.split() if len(t) > 3]
+            f_terms = [t for t in f_name_lower.split() if len(t) > 3]
+            if any(t in f_terms for t in p_terms) and any(w in f_name_lower for w in ["smear", "antigen", "test", "culture", "pcr"]):
+                return "CONTRADICTS"
+            return "SUPPORTS"
+        else:
+            return "SUPPORTS"
+
+    # General fallback
+    if is_negative_finding:
+        return "SUPPORTS" if (is_stability or is_rule_out) else "CONTRADICTS"
+    return "SUPPORTS"
+
+
 def sync_patient_evidence_to_backend(patient_id, record, n8n_result=None, source_doc_id=None, source_doc_name=None):
     """
     Syncs structured clinical findings, symptoms, laboratory test results, medications,
@@ -784,12 +865,7 @@ def sync_patient_evidence_to_backend(patient_id, record, n8n_result=None, source
                                     "evidence_state": f["evidence_state"]
                                 })
 
-                                if f["evidence_state"] == "NOT_YET_TESTED":
-                                    rel_type = "INDICATES"
-                                elif f["evidence_state"] == "TESTED_NEGATIVE":
-                                    rel_type = "CONTRADICTS" if "unlikely" not in raw_pname.lower() and "ruled out" not in raw_pname.lower() else "SUPPORTS"
-                                else:
-                                    rel_type = "CONTRADICTS" if "unlikely" in raw_pname.lower() or "ruled out" in raw_pname.lower() else "SUPPORTS"
+                                rel_type = determine_relationship_type(f, raw_pname, atomic_pname)
 
                                 edges.append({
                                     "source_node_id": actual_ev_id,
@@ -5857,8 +5933,8 @@ def render_clinical_evidence_graph_page(patient_id, patient_record=None):
     st.markdown("## 🕸️ Clinical Evidence Graph")
 
     st.info(
-        "⚠️ **AI Decision Support Notice**: This Clinical Evidence Graph visually connects patient findings, symptoms, laboratory tests, diagnoses, and medical documents. "
-        "All graph relationships are intended strictly as clinical decision-support and must be verified by a healthcare professional."
+        "⚠️ **AI Decision Support Notice**: This hierarchical clinical evidence map connects patient diagnoses and hypotheses with supporting, contradicting, and missing atomic findings. "
+        "Click any **Diagnosis node** (`[+]`) to expand its evidence branches. Click any node to view detailed clinical provenance and metadata below."
     )
 
     if not patient_id:
@@ -5874,119 +5950,655 @@ def render_clinical_evidence_graph_page(patient_id, patient_record=None):
         return
 
     graph_data = res.json()
-    nodes = graph_data.get("nodes", [])
-    edges = graph_data.get("edges", [])
+    all_nodes = graph_data.get("nodes", [])
+    all_edges = graph_data.get("edges", [])
 
-    if not nodes:
+    if not all_nodes:
         empty_state("No evidence nodes found yet for this patient. Upload a document or record symptoms/labs to populate the evidence graph.")
         return
 
-    # Metrics Summary Row
+    # Patient name resolution
+    patient_name = "Patient"
+    if patient_record and isinstance(patient_record, dict):
+        patient_name = patient_record.get("name") or "Patient"
+
+    # Metrics Summary Row (preserved)
     m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Total Evidence Nodes", len(nodes))
-    m2.metric("Symptoms", len([n for n in nodes if n.get("evidence_type") == "SYMPTOM"]))
-    m3.metric("Lab Results", len([n for n in nodes if n.get("evidence_type") == "LAB_RESULT"]))
-    m4.metric("Medications", len([n for n in nodes if n.get("evidence_type") == "MEDICATION"]))
-    m5.metric("Documents", len([n for n in nodes if n.get("evidence_type") == "DOCUMENT"]))
+    m1.metric("Total Evidence Nodes", len(all_nodes))
+    m2.metric("Symptoms", len([n for n in all_nodes if n.get("evidence_type") == "SYMPTOM"]))
+    m3.metric("Lab Results", len([n for n in all_nodes if n.get("evidence_type") == "LAB_RESULT"]))
+    m4.metric("Medications", len([n for n in all_nodes if n.get("evidence_type") == "MEDICATION"]))
+    m5.metric("Documents", len([n for n in all_nodes if n.get("evidence_type") == "DOCUMENT"]))
 
     st.write("")
 
-    # Visual Graphviz Digraph
-    dot = graphviz.Digraph(comment="Clinical Evidence Graph")
-    dot.attr(rankdir="LR", bgcolor="transparent")
-    dot.attr("node", shape="box", style="rounded,filled", fontname="Arial", fontsize="10")
+    # Manage State for Interactive Collapsible Graph
+    if "expanded_diagnosis_ids" not in st.session_state:
+        st.session_state["expanded_diagnosis_ids"] = set()
+    if "selected_evidence_node_id" not in st.session_state:
+        st.session_state["selected_evidence_node_id"] = None
 
-    color_map = {
-        "SYMPTOM": "#FFF3E0",
-        "LAB_RESULT": "#E3F2FD",
-        "MEDICATION": "#E8F5E9",
-        "DIAGNOSIS": "#FFEBEE",
-        "CLINICAL_NOTE": "#F3E5F5",
-        "DOCUMENT": "#E0F2F1",
-        "TIMELINE_EVENT": "#ECEFF1"
-    }
+    node_map = {n["id"]: n for n in all_nodes}
+    diagnosis_nodes = [n for n in all_nodes if n.get("evidence_type") == "DIAGNOSIS"]
+    diagnosis_ids = {n["id"] for n in diagnosis_nodes}
 
-    font_color_map = {
-        "SYMPTOM": "#E65100",
-        "LAB_RESULT": "#0D47A1",
-        "MEDICATION": "#1B5E20",
-        "DIAGNOSIS": "#B71C1C",
-        "CLINICAL_NOTE": "#4A148C",
-        "DOCUMENT": "#004D40",
-        "TIMELINE_EVENT": "#37474F"
-    }
+    # Controls Bar: Expand All / Collapse to High-Level
+    col_ctrl1, col_ctrl2, col_ctrl3 = st.columns([1.5, 1.5, 3])
+    with col_ctrl1:
+        if st.button("➕ Expand All Diagnoses", use_container_width=True):
+            st.session_state["expanded_diagnosis_ids"] = set(diagnosis_ids)
+            st.rerun()
+    with col_ctrl2:
+        if st.button("➖ Collapse to High-Level", use_container_width=True):
+            st.session_state["expanded_diagnosis_ids"] = set()
+            st.rerun()
+    with col_ctrl3:
+        num_expanded = len(st.session_state["expanded_diagnosis_ids"])
+        st.caption(f"Showing **{len(diagnosis_nodes)} Diagnoses** ({num_expanded}/{len(diagnosis_nodes)} expanded). Click a diagnosis node (`[+]`) to toggle its evidence tree.")
 
-    for n in nodes:
-        nid = f"n_{n['id']}"
-        etype = n.get("evidence_type", "CLINICAL_NOTE")
-        name = n.get("name", "Unnamed")
-        val = n.get("value")
-        unit = n.get("unit")
-        estate = n.get("evidence_state", "PRESENT")
+    # BUILD DETERMINISTIC HIERARCHICAL GRAPH (Level 0: Patient -> Level 1: Diagnoses -> Level 2: Categories -> Level 3: Evidence -> Level 4: Source Documents)
+    expanded_diag_ids = st.session_state["expanded_diagnosis_ids"]
+    selected_node_id = st.session_state["selected_evidence_node_id"]
 
-        lbl = f"{name}\n[{etype}]"
-        if val:
-            lbl += f"\nValue: {val} {unit or ''}".strip()
-        if estate == "NOT_YET_TESTED":
-            lbl += "\n(Not Yet Tested)"
+    agraph_nodes = []
+    agraph_edges = []
+    seen_graph_ids = set()
 
-        bg = color_map.get(etype, "#FFFFFF")
-        fg = font_color_map.get(etype, "#000000")
-        dot.node(nid, label=lbl, fillcolor=bg, fontcolor=fg, color=fg)
+    def add_agraph_node(n_obj):
+        if n_obj.id not in seen_graph_ids:
+            seen_graph_ids.add(n_obj.id)
+            agraph_nodes.append(n_obj)
 
-    for e in edges:
-        src = f"n_{e['source_node_id']}"
-        tgt = f"n_{e['target_node_id']}"
-        rel = e.get("relationship_type", "ASSOCIATED_WITH")
-        dot.edge(src, tgt, label=rel, fontname="Arial", fontsize="8", color="#546E7A")
+    # 1. Level 0: Patient Root Node
+    root_id = "node_patient_root"
+    is_root_selected = selected_node_id == "patient_root"
+    add_agraph_node(Node(
+        id=root_id,
+        label=f"👤 Patient: {patient_name}\nID: {patient_id}",
+        title=f"<b>Patient: {patient_name}</b><br>ID: {patient_id}<br>Total Diagnoses: {len(diagnosis_nodes)}",
+        shape="box",
+        level=0,
+        color={"background": "#FFF9C4" if is_root_selected else "#EEF2FF", "border": "#F59E0B" if is_root_selected else "#4F46E5"},
+        font={"color": "#312E81", "size": 13, "bold": True, "face": "Arial"},
+        borderWidth=3 if is_root_selected else 2,
+        shadow=True
+    ))
 
-    st.graphviz_chart(dot, use_container_width=True)
+    # 2. Level 1: Diagnoses
+    for d in diagnosis_nodes:
+        did = str(d["id"])
+        dname = d.get("name", "Diagnosis")
+        conf = d.get("confidence", "High")
+        conf_str = f"{conf}%" if str(conf).isdigit() else str(conf)
+        is_exp = d["id"] in expanded_diag_ids
+        exp_badge = "[−]" if is_exp else "[＋]"
+        dlabel = f"🧠 {dname}\n{conf_str}  {exp_badge}"
+        
+        is_sel = selected_node_id == d["id"]
+        add_agraph_node(Node(
+            id=did,
+            label=dlabel,
+            title=f"<b>{dname}</b><br>Confidence: {conf_str}<br>Click to {'collapse' if is_exp else 'expand evidence'}",
+            shape="box",
+            level=1,
+            color={"background": "#FFF9C4" if is_sel else "#FFE4E6", "border": "#F59E0B" if is_sel else "#E11D48"},
+            font={"color": "#9F1239", "size": 12, "bold": True, "face": "Arial"},
+            borderWidth=3 if is_sel else 2,
+            shadow=True
+        ))
 
+        agraph_edges.append(Edge(
+            source=root_id,
+            target=did,
+            color="#94A3B8",
+            arrows="to",
+            smooth={"type": "cubicBezier", "roundness": 0.4}
+        ))
+
+        # 3. If Diagnosis is expanded, build Level 2 (Categories), Level 3 (Evidence), Level 4 (Source)
+        if is_exp:
+            connected_edges = [e for e in all_edges if e["target_node_id"] == d["id"] or e["source_node_id"] == d["id"]]
+            
+            sup_items = []
+            con_items = []
+            mis_items = []
+            seen_finding_ids = set()
+
+            for e in connected_edges:
+                other_id = e["source_node_id"] if e["target_node_id"] == d["id"] else e["target_node_id"]
+                if other_id == d["id"] or other_id in seen_finding_ids:
+                    continue
+                fnode = node_map.get(other_id)
+                if not fnode or fnode.get("evidence_type") == "DIAGNOSIS":
+                    continue
+                
+                seen_finding_ids.add(other_id)
+                rel = e.get("relationship_type", "SUPPORTS")
+                estate = fnode.get("evidence_state", "PRESENT")
+
+                if estate == "NOT_YET_TESTED" or rel == "INDICATES":
+                    mis_items.append((fnode, e))
+                elif rel == "CONTRADICTS":
+                    con_items.append((fnode, e))
+                else:
+                    sup_items.append((fnode, e))
+
+            branches = [
+                ("Supporting", sup_items, "#DCFCE7", "#16A34A", "#166534", "cat_sup", "✅"),
+                ("Contradicting", con_items, "#FEE2E2", "#DC2626", "#991B1B", "cat_con", "❌"),
+                ("Missing / Needed", mis_items, "#FEF3C7", "#D97706", "#92400E", "cat_mis", "⚠️")
+            ]
+
+            for cat_title, findings_list, bg_col, border_col, font_col, prefix, icon in branches:
+                if not findings_list:
+                    continue
+                
+                cat_id = f"{prefix}_{d['id']}"
+                add_agraph_node(Node(
+                    id=cat_id,
+                    label=f"{icon} {cat_title}\n({len(findings_list)})",
+                    title=f"Category: {cat_title} evidence for {dname}",
+                    shape="box",
+                    level=2,
+                    color={"background": bg_col, "border": border_col},
+                    font={"color": font_col, "size": 11, "bold": True, "face": "Arial"},
+                    borderWidth=1.5
+                ))
+
+                agraph_edges.append(Edge(
+                    source=did,
+                    target=cat_id,
+                    color=border_col,
+                    arrows="to",
+                    smooth={"type": "cubicBezier"}
+                ))
+
+                for fnode, edge_obj in findings_list:
+                    fid = str(fnode["id"])
+                    fname = fnode.get("name", "Finding")
+                    fval = fnode.get("value")
+                    funit = fnode.get("unit")
+                    ftype = fnode.get("evidence_type", "CLINICAL_NOTE")
+                    festate = fnode.get("evidence_state", "PRESENT")
+                    fconf = fnode.get("confidence", "High")
+
+                    type_icon = "🔬" if ftype == "LAB_RESULT" else ("🩺" if ftype == "SYMPTOM" else ("💊" if ftype == "MEDICATION" else ("⏱️" if ftype == "TIMELINE_EVENT" else "📌")))
+                    flabel = f"{type_icon} {fname}"
+                    if fval and fval not in ("Present", "Documented", "Absent"):
+                        flabel += f"\n{fval} {funit or ''}".strip()
+                    elif festate == "NOT_YET_TESTED":
+                        flabel += "\n(Not Tested)"
+                    elif festate == "TESTED_NEGATIVE" or fval == "Absent":
+                        flabel += "\n(Negative / Absent)"
+
+                    is_f_sel = selected_node_id == fnode["id"]
+                    add_agraph_node(Node(
+                        id=fid,
+                        label=flabel,
+                        title=f"<b>{fname}</b><br>Type: {ftype}<br>State: {festate}<br>Value: {fval or 'N/A'}<br>Confidence: {fconf}",
+                        shape="box",
+                        level=3,
+                        color={"background": "#FFF9C4" if is_f_sel else bg_col, "border": "#F59E0B" if is_f_sel else border_col},
+                        font={"color": font_col, "size": 11, "face": "Arial"},
+                        borderWidth=2.5 if is_f_sel else 1
+                    ))
+
+                    agraph_edges.append(Edge(
+                        source=cat_id,
+                        target=fid,
+                        color=border_col,
+                        arrows="to",
+                        smooth={"type": "cubicBezier"}
+                    ))
+
+                    # Level 4: Source Document
+                    doc_name = fnode.get("source_document_name")
+                    if doc_name:
+                        doc_id = f"doc_{doc_name.replace(' ', '_').lower()}"
+                        add_agraph_node(Node(
+                            id=doc_id,
+                            label=f"📄 {doc_name[:22]}",
+                            title=f"Source Document: {doc_name}",
+                            shape="box",
+                            level=4,
+                            color={"background": "#E0F2FE", "border": "#0284C7"},
+                            font={"color": "#0369A1", "size": 10, "face": "Arial"},
+                            borderWidth=1
+                        ))
+                        agraph_edges.append(Edge(
+                            source=fid,
+                            target=doc_id,
+                            color="#94A3B8",
+                            arrows="to",
+                            dashes=True,
+                            label="Source"
+                        ))
+
+    # Graph Configuration for Deterministic Hierarchical Layout with STABLE VIEWPORT (No Auto-Fit / No Progressive Shrinking)
+    graph_config = Config(
+        height=660,
+        directed=True,
+        hierarchical=True,
+        physics=False,
+        direction="UD",
+        sortMethod="directed",
+        levelSeparation=120,
+        nodeSpacing=180,
+        treeSpacing=200,
+        blockShifting=False,
+        edgeMinimization=False,
+        parentCentralization=True,
+        improvedLayout=False,
+        stabilization=False,
+        fit=False,
+        autoResize=False,
+        interaction={
+            "zoomView": True,
+            "dragView": True,
+            "hover": True,
+            "navigationButtons": False,
+            "keyboard": False,
+            "zoomSpeed": 0.15,
+            "minZoom": 0.5,
+            "maxZoom": 3.0
+        }
+    )
+    # Fix Config's default '100%px' bug to ensure valid 100% CSS width
+    graph_config.width = "100%"
+
+    # Render interactive graph
+    clicked_node_id = agraph(nodes=agraph_nodes, edges=agraph_edges, config=graph_config)
+
+    # Inject Floating Zoom Controls, Viewport Stabilizer, and Click-to-Activate Wheel Handler
+    zoom_controls_html = """
+    <script>
+    (function() {
+      const parentDoc = window.parent.document;
+      let checkCount = 0;
+
+      function setupZoomControls() {
+        checkCount++;
+        const iframes = Array.from(parentDoc.querySelectorAll('iframe'));
+        const agraphIframe = iframes.find(f => (f.title && f.title.includes('agraph')) || (f.src && f.src.includes('streamlit_agraph')));
+        
+        if (!agraphIframe) {
+          if (checkCount < 60) setTimeout(setupZoomControls, 50);
+          return;
+        }
+
+        const container = agraphIframe.closest('[data-testid="stCustomComponentV1"]') || agraphIframe.parentElement;
+        if (!container) return;
+
+        container.style.position = 'relative';
+        container.style.width = '100%';
+        agraphIframe.style.width = '100%';
+
+        // Clean up previous elements on re-render to prevent duplicate toolbars
+        const oldToolbar = container.querySelector('#graph-zoom-toolbar');
+        if (oldToolbar) oldToolbar.remove();
+        const oldBadge = container.querySelector('#graph-zoom-status');
+        if (oldBadge) oldBadge.remove();
+
+        const toolbar = parentDoc.createElement('div');
+        toolbar.id = 'graph-zoom-toolbar';
+        toolbar.style.cssText = `
+          position: absolute;
+          top: 14px;
+          right: 18px;
+          z-index: 1000;
+          display: flex;
+          flex-direction: column;
+          gap: 4px;
+          background: rgba(255, 255, 255, 0.95);
+          backdrop-filter: blur(8px);
+          border: 1px solid #CBD5E1;
+          border-radius: 8px;
+          padding: 5px;
+          box-shadow: 0 4px 14px rgba(0,0,0,0.12);
+          user-select: none;
+        `;
+
+        const statusBadge = parentDoc.createElement('div');
+        statusBadge.id = 'graph-zoom-status';
+        statusBadge.style.cssText = `
+          position: absolute;
+          top: 14px;
+          left: 18px;
+          z-index: 999;
+          background: rgba(248, 250, 252, 0.92);
+          backdrop-filter: blur(6px);
+          border: 1px solid #CBD5E1;
+          border-radius: 6px;
+          padding: 4px 10px;
+          font-size: 11px;
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+          font-weight: 600;
+          color: #64748B;
+          pointer-events: none;
+          transition: all 0.2s ease;
+        `;
+
+        let isZoomActive = false;
+        const MIN_ZOOM = 0.5;
+        const MAX_ZOOM = 3.0;
+        const ZOOM_STEP = 0.15;
+        let currentZoom = 1.0;
+
+        function updateBadge() {
+          const zoomPct = Math.round(currentZoom * 100);
+          if (isZoomActive) {
+            statusBadge.style.background = '#EFF6FF';
+            statusBadge.style.borderColor = '#3B82F6';
+            statusBadge.style.color = '#1D4ED8';
+            statusBadge.innerText = `🔍 Zoom Mode Active (${zoomPct}%) • Scroll to Zoom • Click outside to lock`;
+          } else {
+            statusBadge.style.background = 'rgba(248, 250, 252, 0.92)';
+            statusBadge.style.borderColor = '#CBD5E1';
+            statusBadge.style.color = '#64748B';
+            statusBadge.innerText = `🔒 Page Scroll (${zoomPct}%) • Click Graph to Zoom`;
+          }
+        }
+
+        function triggerVisZoom(deltaY) {
+          try {
+            const innerDoc = agraphIframe.contentDocument || (agraphIframe.contentWindow && agraphIframe.contentWindow.document);
+            if (innerDoc) {
+              const canvas = innerDoc.querySelector('canvas');
+              if (canvas) {
+                const rect = canvas.getBoundingClientRect();
+                const wheelEvent = new WheelEvent('wheel', {
+                  deltaY: deltaY,
+                  clientX: rect.left + rect.width / 2,
+                  clientY: rect.top + rect.height / 2,
+                  bubbles: true,
+                  cancelable: true
+                });
+                canvas.dispatchEvent(wheelEvent);
+              }
+            }
+          } catch(e) {
+            console.warn('Vis zoom dispatch error:', e);
+          }
+        }
+
+        function applyZoomDelta(delta) {
+          const targetZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, currentZoom + delta));
+          if (targetZoom === currentZoom) return;
+
+          currentZoom = Math.round(targetZoom * 100) / 100;
+          triggerVisZoom(delta > 0 ? -120 : 120);
+          updateBadge();
+        }
+
+        function resetZoom() {
+          const stepsNeeded = Math.round((1.0 - currentZoom) / ZOOM_STEP);
+          currentZoom = 1.0;
+
+          if (stepsNeeded !== 0) {
+            const deltaY = stepsNeeded > 0 ? -120 * Math.abs(stepsNeeded) : 120 * Math.abs(stepsNeeded);
+            triggerVisZoom(deltaY);
+          }
+          updateBadge();
+        }
+
+        function createBtn(text, title, onClick, isSmall = false) {
+          const btn = parentDoc.createElement('button');
+          btn.type = 'button';
+          btn.title = title;
+          btn.innerText = text;
+          btn.style.cssText = `
+            width: ${isSmall ? 'auto' : '32px'};
+            min-width: ${isSmall ? '48px' : '32px'};
+            height: ${isSmall ? '24px' : '32px'};
+            border: 1px solid #CBD5E1;
+            background: #FFFFFF;
+            color: #1E293B;
+            border-radius: 5px;
+            font-size: ${isSmall ? '11px' : '16px'};
+            font-weight: 700;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.15s ease;
+            outline: none;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+          `;
+          btn.onmouseenter = () => { btn.style.background = '#F1F5F9'; btn.style.borderColor = '#94A3B8'; };
+          btn.onmouseleave = () => { btn.style.background = '#FFFFFF'; btn.style.borderColor = '#CBD5E1'; };
+          btn.onmousedown = (e) => { e.stopPropagation(); btn.style.transform = 'scale(0.95)'; };
+          btn.onmouseup = () => { btn.style.transform = 'scale(1)'; };
+          btn.onclick = (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            onClick();
+          };
+          return btn;
+        }
+
+        const zoomInBtn = createBtn('+', 'Zoom In (+)', () => applyZoomDelta(ZOOM_STEP));
+        const zoomOutBtn = createBtn('−', 'Zoom Out (−)', () => applyZoomDelta(-ZOOM_STEP));
+        const resetBtn = createBtn('Reset', 'Reset Zoom to Default (100%)', resetZoom, true);
+
+        toolbar.appendChild(zoomInBtn);
+        toolbar.appendChild(zoomOutBtn);
+        toolbar.appendChild(resetBtn);
+
+        container.appendChild(toolbar);
+        container.appendChild(statusBadge);
+
+        // Click-to-activate logic
+        container.addEventListener('click', (e) => {
+          isZoomActive = true;
+          updateBadge();
+        }, true);
+
+        parentDoc.addEventListener('click', (e) => {
+          if (!container.contains(e.target)) {
+            isZoomActive = false;
+            updateBadge();
+          }
+        });
+
+        try {
+          const innerDoc = agraphIframe.contentDocument || (agraphIframe.contentWindow && agraphIframe.contentWindow.document);
+          if (innerDoc) {
+            innerDoc.addEventListener('click', () => {
+              isZoomActive = true;
+              updateBadge();
+            });
+          }
+        } catch(e) {}
+
+        // Wheel event listener: passive false so preventDefault works when active
+        container.addEventListener('wheel', (e) => {
+          if (!isZoomActive) {
+            // Inactive: allow default page scroll
+            return;
+          }
+          e.preventDefault();
+          e.stopPropagation();
+          if (e.deltaY < 0) {
+            applyZoomDelta(ZOOM_STEP);
+          } else if (e.deltaY > 0) {
+            applyZoomDelta(-ZOOM_STEP);
+          }
+        }, { passive: false });
+
+        updateBadge();
+      }
+
+      setupZoomControls();
+    })();
+    </script>
+    """
+    components.html(zoom_controls_html, height=0)
+
+    # Handle interactive clicks
+    if clicked_node_id:
+        if clicked_node_id == "node_patient_root":
+            st.session_state["selected_evidence_node_id"] = "patient_root"
+            st.rerun()
+        elif str(clicked_node_id).startswith("cat_"):
+            # Clicked a category node
+            st.session_state["selected_evidence_node_id"] = clicked_node_id
+            st.rerun()
+        elif str(clicked_node_id).startswith("doc_"):
+            # Clicked a document node
+            st.session_state["selected_evidence_node_id"] = clicked_node_id
+            st.rerun()
+        elif str(clicked_node_id).isdigit():
+            clicked_id_int = int(clicked_node_id)
+            # Check if clicked node was a diagnosis -> toggle expansion
+            if clicked_id_int in diagnosis_ids:
+                if clicked_id_int in st.session_state["expanded_diagnosis_ids"]:
+                    st.session_state["expanded_diagnosis_ids"].remove(clicked_id_int)
+                else:
+                    st.session_state["expanded_diagnosis_ids"].add(clicked_id_int)
+            st.session_state["selected_evidence_node_id"] = clicked_id_int
+            st.rerun()
+
+    # Evidence Detail Panel (outside graph canvas)
     st.markdown("---")
     st.markdown("### 📋 Evidence Detail Panel")
 
-    node_options = {f"[{n.get('evidence_type')}] {n.get('name')} (ID: {n['id']})": n['id'] for n in nodes}
-    selected_option = st.selectbox("Select an evidence node to view detailed provenance and clinical metadata:", list(node_options.keys()))
+    # Build node dropdown options
+    dropdown_options = {}
+    dropdown_options["[PATIENT] Patient Overview"] = "patient_root"
+    for d in diagnosis_nodes:
+        dropdown_options[f"[DIAGNOSIS] {d.get('name')} (ID: {d['id']})"] = d["id"]
+    for n in all_nodes:
+        if n.get("evidence_type") != "DIAGNOSIS":
+            dropdown_options[f"[{n.get('evidence_type')}] {n.get('name')} (ID: {n['id']})"] = n["id"]
+
+    default_index = 0
+    if st.session_state.get("selected_evidence_node_id"):
+        for idx, (lbl, nid_val) in enumerate(dropdown_options.items()):
+            if nid_val == st.session_state["selected_evidence_node_id"]:
+                default_index = idx
+                break
+
+    selected_option = st.selectbox(
+        "Select a node to inspect provenance and clinical metadata (or click any node on the graph):",
+        list(dropdown_options.keys()),
+        index=default_index
+    )
 
     if selected_option:
-        sel_id = node_options[selected_option]
-        det_res = get_evidence_details(patient_id, sel_id)
+        sel_id = dropdown_options[selected_option]
+        st.session_state["selected_evidence_node_id"] = sel_id
 
-        if det_res.status_code == 200:
-            det = det_res.json()
-            n_data = det.get("node", {})
-            out_edges = det.get("outgoing_edges", [])
-            in_edges = det.get("incoming_edges", [])
-            rel_nodes = det.get("related_nodes", [])
+        # Render detail based on selection type
+        if sel_id == "patient_root":
+            st.markdown(f"#### 👤 Patient: {patient_name} ({patient_id})")
+            p_c1, p_c2, p_c3 = st.columns(3)
+            with p_c1:
+                st.write(f"**Total Diagnoses:** {len(diagnosis_nodes)}")
+                st.write(f"**Total Clinical Findings:** {len(all_nodes)}")
+            with p_c2:
+                st.write(f"**Laboratory Results:** {len([n for n in all_nodes if n.get('evidence_type') == 'LAB_RESULT'])}")
+                st.write(f"**Symptoms Recorded:** {len([n for n in all_nodes if n.get('evidence_type') == 'SYMPTOM'])}")
+            with p_c3:
+                st.write(f"**Source Documents:** {len([n for n in all_nodes if n.get('evidence_type') == 'DOCUMENT'])}")
+                st.write(f"**Active Relationships:** {len(all_edges)}")
 
-            c_left, c_right = st.columns(2)
+        elif isinstance(sel_id, int):
+            det_res = get_evidence_details(patient_id, sel_id)
+            if det_res.status_code == 200:
+                det = det_res.json()
+                n_data = det.get("node", {})
+                out_edges = det.get("outgoing_edges", [])
+                in_edges = det.get("incoming_edges", [])
+                rel_nodes = det.get("related_nodes", [])
 
-            with c_left:
-                st.markdown(f"#### Evidence: {n_data.get('name') or 'Not available'}")
-                st.write(f"**Value:** {n_data.get('value') if n_data.get('value') is not None else 'Not available'} {n_data.get('unit') or ''}")
-                st.write(f"**Date:** {n_data.get('date') if n_data.get('date') is not None else 'Not available'}")
-                st.write(f"**Type:** {n_data.get('evidence_type') or 'Not available'}")
-                st.write(f"**Evidence state:** `{n_data.get('evidence_state') or 'Not available'}`")
+                etype = n_data.get("evidence_type", "CLINICAL_NOTE")
 
-            with c_right:
-                st.write(f"**Source Document:** {n_data.get('source_document_name') if n_data.get('source_document_name') is not None else 'Not available'}")
-                st.write(f"**Source Type:** {n_data.get('source_type') if n_data.get('source_type') is not None else 'Not available'}")
-                st.write(f"**Confidence:** {n_data.get('confidence') if n_data.get('confidence') is not None else 'Not available'}")
-                st.write(f"**Verification:** {n_data.get('verification_status') if n_data.get('verification_status') is not None else 'Not available'}")
-                st.write(f"**Recorded Date:** {n_data.get('created_at') if n_data.get('created_at') is not None else 'Not available'}")
+                # If selected node is a Diagnosis
+                if etype == "DIAGNOSIS":
+                    st.markdown(f"#### 🧠 Diagnosis: {n_data.get('name')}")
+                    d_c1, d_c2 = st.columns(2)
+                    with d_c1:
+                        conf_val = n_data.get("confidence")
+                        conf_str = f"{conf_val}%" if str(conf_val).isdigit() else str(conf_val or "High")
+                        st.write(f"**Confidence Assessment:** `{conf_str}`")
+                        st.write(f"**Clinical Status:** `{n_data.get('value') or 'Active Diagnosis'}`")
+                    with d_c2:
+                        st.write(f"**Source Document:** {n_data.get('source_document_name') or 'Clinical Evidence Extraction'}")
+                        st.write(f"**Verification:** `{n_data.get('verification_status') or 'Pending Review'}`")
 
-            st.markdown("##### 🔗 Related Evidence & Relationships")
-            if not out_edges and not in_edges:
-                st.write("Not available (No active graph relationships)")
-            else:
-                for edge in out_edges:
-                    tgt_item = next((r for r in rel_nodes if r['id'] == edge['target_node_id']), None)
-                    tgt_name = tgt_item.get('name') if tgt_item else f"Node #{edge['target_node_id']}"
-                    st.write(f"- **{n_data.get('name')}** --[`{edge.get('relationship_type')}`]--> **{tgt_name}** (Confidence: {edge.get('confidence', 'High')})")
-                for edge in in_edges:
-                    src_item = next((r for r in rel_nodes if r['id'] == edge['source_node_id']), None)
-                    src_name = src_item.get('name') if src_item else f"Node #{edge['source_node_id']}"
-                    st.write(f"- **{src_name}** --[`{edge.get('relationship_type')}`]--> **{n_data.get('name')}** (Confidence: {edge.get('confidence', 'High')})")
+                    # Categorized Evidence Breakdown for this Diagnosis
+                    connected_rel_nodes = []
+                    for e in in_edges + out_edges:
+                        other_nid = e["source_node_id"] if e["target_node_id"] == n_data["id"] else e["target_node_id"]
+                        item = next((r for r in rel_nodes if r["id"] == other_nid), None)
+                        if item and item.get("evidence_type") != "DIAGNOSIS":
+                            connected_rel_nodes.append((item, e.get("relationship_type", "SUPPORTS")))
+
+                    sup_list = [item for item, rel in connected_rel_nodes if rel in {"SUPPORTS", "CONFIRMS", "CORROBORATES"} and item.get("evidence_state") != "NOT_YET_TESTED"]
+                    con_list = [item for item, rel in connected_rel_nodes if rel == "CONTRADICTS"]
+                    mis_list = [item for item, rel in connected_rel_nodes if rel == "INDICATES" or item.get("evidence_state") == "NOT_YET_TESTED"]
+
+                    st.markdown("---")
+                    st.markdown("##### 🧬 Evidence Breakdown for this Diagnosis")
+                    b_col1, b_col2, b_col3 = st.columns(3)
+                    with b_col1:
+                        st.markdown(f"**✅ Supporting ({len(sup_list)})**")
+                        if not sup_list:
+                            st.caption("None documented")
+                        else:
+                            for item in sup_list:
+                                val_s = f" ({item.get('value')} {item.get('unit') or ''})" if item.get('value') and item.get('value') not in ('Present', 'Documented') else ""
+                                st.write(f"- **{item.get('name')}**{val_s} `[{item.get('evidence_type')}]`")
+
+                    with b_col2:
+                        st.markdown(f"**❌ Contradicting ({len(con_list)})**")
+                        if not con_list:
+                            st.caption("None documented")
+                        else:
+                            for item in con_list:
+                                val_s = f" ({item.get('value')})" if item.get('value') else ""
+                                st.write(f"- **{item.get('name')}**{val_s} `[{item.get('evidence_type')}]`")
+
+                    with b_col3:
+                        st.markdown(f"**⚠️ Missing / Indicated ({len(mis_list)})**")
+                        if not mis_list:
+                            st.caption("None documented")
+                        else:
+                            for item in mis_list:
+                                st.write(f"- **{item.get('name')}** `(Not Yet Tested)`")
+
+                else:
+                    # Regular atomic evidence finding
+                    icon = "🔬" if etype == "LAB_RESULT" else ("🩺" if etype == "SYMPTOM" else ("💊" if etype == "MEDICATION" else ("⏱️" if etype == "TIMELINE_EVENT" else "📌")))
+                    st.markdown(f"#### {icon} Finding: {n_data.get('name')}")
+                    c_left, c_right = st.columns(2)
+
+                    with c_left:
+                        st.write(f"**Type:** `{etype}`")
+                        st.write(f"**Value:** `{n_data.get('value') if n_data.get('value') is not None else 'Not available'}` {n_data.get('unit') or ''}")
+                        st.write(f"**Evidence State:** `{n_data.get('evidence_state') or 'PRESENT'}`")
+                        st.write(f"**Date:** {n_data.get('date') if n_data.get('date') is not None else 'Document Date'}")
+
+                    with c_right:
+                        st.write(f"**Source Document:** {n_data.get('source_document_name') or 'N8N AI Analysis'}")
+                        st.write(f"**Confidence:** `{n_data.get('confidence') or 'High'}`")
+                        st.write(f"**Verification:** `{n_data.get('verification_status') or 'Confirmed'}`")
+                        st.write(f"**Recorded:** {n_data.get('created_at')[:10] if n_data.get('created_at') else 'N/A'}")
+
+                    st.markdown("##### 🔗 Connected Diagnoses & Relationships")
+                    if not out_edges and not in_edges:
+                        st.caption("No active graph relationships")
+                    else:
+                        for edge in out_edges:
+                            tgt_item = next((r for r in rel_nodes if r["id"] == edge["target_node_id"]), None)
+                            tgt_name = tgt_item.get("name") if tgt_item else f"Node #{edge['target_node_id']}"
+                            rel_color = "green" if edge.get("relationship_type") in {"SUPPORTS", "CONFIRMS"} else ("red" if edge.get("relationship_type") == "CONTRADICTS" else "orange")
+                            st.markdown(f"- **{n_data.get('name')}** --[:{rel_color}[`{edge.get('relationship_type')}`]]--> **{tgt_name}** (Confidence: {edge.get('confidence', 'High')})")
+                        for edge in in_edges:
+                            src_item = next((r for r in rel_nodes if r["id"] == edge["source_node_id"]), None)
+                            src_name = src_item.get("name") if src_item else f"Node #{edge['source_node_id']}"
+                            rel_color = "green" if edge.get("relationship_type") in {"SUPPORTS", "CONFIRMS"} else ("red" if edge.get("relationship_type") == "CONTRADICTS" else "orange")
+                            st.markdown(f"- **{src_name}** --[:{rel_color}[`{edge.get('relationship_type')}`]]--> **{n_data.get('name')}** (Confidence: {edge.get('confidence', 'High')})")
 
 
 # ==============================================================
@@ -8438,6 +9050,131 @@ def route_patient(
 
 
 # ==============================================================
+# DOCTOR NOTES PAGE
+# ==============================================================
+
+def doctor_notes_page(user):
+    st.markdown("## 📝 Doctor Notes")
+    st.caption("Record and review clinical notes for the selected patient.")
+
+    patients = load_db(PATIENTS_FILE)
+    if not patients:
+        empty_state("No patients available in the system.")
+        return
+
+    patient_options = {}
+    for pid, p in patients.items():
+        pname = p.get("name", "Unknown Patient")
+        label = f"{pname} ({pid})"
+        patient_options[label] = pid
+
+    curr_pid = st.session_state.get("selected_patient_id")
+    curr_index = 0
+    if curr_pid and curr_pid in patients:
+        for idx, (lbl, pid) in enumerate(patient_options.items()):
+            if pid == curr_pid:
+                curr_index = idx
+                break
+
+    selected_label = st.selectbox(
+        "Select Patient",
+        options=list(patient_options.keys()),
+        index=curr_index,
+        key="doctor_notes_patient_selector"
+    )
+
+    selected_patient_id = patient_options[selected_label]
+    st.session_state["selected_patient_id"] = selected_patient_id
+    patient = patients.get(selected_patient_id, {})
+
+    st.markdown(f"### 👤 {patient.get('name', 'Patient')}")
+    st.caption(f"Patient ID: {selected_patient_id}")
+
+    st.markdown("#### ✏️ Clinical Note")
+    note_input_key = f"doctor_clinical_note_input_{selected_patient_id}"
+    clinical_note_text = st.text_area(
+        label="Clinical Note",
+        label_visibility="collapsed",
+        placeholder="Enter clinical observations, assessment, follow-up plan, treatment notes, or other relevant information...",
+        height=140,
+        key=note_input_key
+    )
+
+    if st.button("💾 Save Notes", key=f"btn_save_doctor_notes_{selected_patient_id}"):
+        if clinical_note_text.strip():
+            author_name = user.get("full_name") or user.get("name") or user.get("email") or "Doctor"
+            now_iso = datetime.now().isoformat()
+
+            new_note = {
+                "id": str(uuid.uuid4())[:8],
+                "text": clinical_note_text.strip(),
+                "author": author_name,
+                "created_at": now_iso
+            }
+
+            if "doctor_notes_history" not in patient or not isinstance(patient["doctor_notes_history"], list):
+                patient["doctor_notes_history"] = []
+
+            # Migrate any legacy single doctor_notes string
+            if patient.get("doctor_notes") and not patient["doctor_notes_history"]:
+                patient["doctor_notes_history"].append({
+                    "id": "legacy_note",
+                    "text": patient["doctor_notes"],
+                    "author": author_name,
+                    "created_at": patient.get("createdAt", now_iso)
+                })
+
+            patient["doctor_notes_history"].insert(0, new_note)
+            patient["doctor_notes"] = clinical_note_text.strip()
+            patients[selected_patient_id] = patient
+            save_db(PATIENTS_FILE, patients)
+
+            st.success("Doctor note saved successfully!")
+            st.rerun()
+        else:
+            st.warning("Please enter some clinical notes before saving.")
+
+    st.markdown("---")
+    st.markdown("#### 📌 Saved Notes")
+
+    notes_history = patient.get("doctor_notes_history", [])
+    if not notes_history and patient.get("doctor_notes"):
+        notes_history = [{
+            "id": "legacy_note",
+            "text": patient.get("doctor_notes"),
+            "author": "Doctor",
+            "created_at": patient.get("createdAt", datetime.now().isoformat())
+        }]
+
+    if notes_history:
+        for note in notes_history:
+            text_content = note.get("text", "")
+            author = note.get("author", "Doctor")
+            created_at = note.get("created_at", "")
+
+            st.markdown(
+                f"""
+                <div style="
+                    background: #F8FAFC;
+                    border: 1px solid #E2E8F0;
+                    border-radius: 8px;
+                    padding: 16px 18px;
+                    margin-bottom: 12px;
+                ">
+                    <div style="font-size: 14px; color: #1E293B; margin-bottom: 10px; line-height: 1.5; white-space: pre-wrap;">{text_content}</div>
+                    <div style="display: flex; justify-content: space-between; font-size: 12px; color: #64748B; border-top: 1px solid #EDF2F7; padding-top: 8px;">
+                        <span>👤 <b>Saved by:</b> {author}</span>
+                        <span>🕒 <b>Last updated:</b> {created_at}</span>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+    else:
+        st.info("No saved notes for this patient yet.")
+
+
+# ==============================================================
 # DOCTOR ROUTER
 # ==============================================================
 
@@ -8521,18 +9258,8 @@ def route_doctor(
 
     elif page == "Notes":
 
-        st.markdown(
-            '<div class="mp-card"><h4>Notes</h4>',
-            unsafe_allow_html=True,
-        )
-
-        empty_state(
-            "No notes recorded yet."
-        )
-
-        st.markdown(
-            "</div>",
-            unsafe_allow_html=True,
+        doctor_notes_page(
+            user
         )
 
     elif page == "Insights":

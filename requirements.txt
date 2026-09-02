@@ -5,3 +5,4 @@ pydantic>=2.0.0
 streamlit>=1.25.0
 requests>=2.31.0
 graphviz>=0.20.1
+streamlit-agraph>=0.0.45

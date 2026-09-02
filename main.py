@@ -666,8 +666,7 @@ def ingest_patient_evidence(
             existing_edge = db.query(EvidenceEdge).filter(
                 EvidenceEdge.patient_id == patient_id,
                 EvidenceEdge.source_node_id == src_id,
-                EvidenceEdge.target_node_id == tgt_id,
-                EvidenceEdge.relationship_type == rel_type
+                EvidenceEdge.target_node_id == tgt_id
             ).first()
             
             if not existing_edge:
@@ -684,8 +683,14 @@ def ingest_patient_evidence(
                 db.refresh(new_edge)
                 created_edges.append(new_edge)
             else:
+                updated_edge = False
+                if existing_edge.relationship_type != rel_type:
+                    existing_edge.relationship_type = rel_type
+                    updated_edge = True
                 if existing_edge.confidence != conf:
                     existing_edge.confidence = conf
+                    updated_edge = True
+                if updated_edge:
                     db.commit()
                     db.refresh(existing_edge)
                 created_edges.append(existing_edge)
