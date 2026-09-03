@@ -162,4 +162,20 @@ class EvidenceEdgeResponse(BaseModel):
 class EvidenceGraphResponse(BaseModel):
     nodes: list[EvidenceNodeResponse]
     edges: list[EvidenceEdgeResponse]
+
+
+# ============================================================
+# CHAT SCHEMAS
+# ============================================================
+
+class PatientChatRequest(BaseModel):
+    patient_id: Optional[str] = None
+    question: str
+    conversation_history: Optional[list[dict]] = []
+
+
+
+class PatientChatResponse(BaseModel):
+    answer: str
+
 

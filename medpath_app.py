@@ -31,6 +31,7 @@ from api_client import (
     get_patient_evidence_graph,
     get_evidence_details,
     ingest_patient_evidence,
+    send_patient_chat,
 )
 
 import graphviz
@@ -1003,6 +1004,34 @@ def inject_css():
 
         .stButton > button {
             border-radius: 10px;
+        }
+
+        /* Active sidebar navigation item styling */
+        .stSidebar [data-testid="stBaseButton-primary"],
+        .stSidebar button[kind="primary"],
+        .stSidebar div.stButton > button[kind="primary"] {
+            background-color: var(--mp-blue) !important;
+            color: #ffffff !important;
+            font-weight: 700 !important;
+            border: 1.5px solid var(--mp-blue-dark) !important;
+            box-shadow: 0 2px 6px rgba(21, 101, 192, 0.3) !important;
+        }
+
+        .stSidebar [data-testid="stBaseButton-secondary"],
+        .stSidebar button[kind="secondary"],
+        .stSidebar div.stButton > button[kind="secondary"] {
+            background-color: #ffffff !important;
+            color: #1E293B !important;
+            border: 1px solid #E2E8F0 !important;
+            font-weight: 500 !important;
+        }
+
+        .stSidebar [data-testid="stBaseButton-secondary"]:hover,
+        .stSidebar button[kind="secondary"]:hover,
+        .stSidebar div.stButton > button[kind="secondary"]:hover {
+            background-color: var(--mp-blue-light) !important;
+            color: var(--mp-blue-dark) !important;
+            border-color: var(--mp-blue) !important;
         }
 
         </style>
@@ -2553,12 +2582,6 @@ def run_n8n_analysis_for_document(patient_id, document, patient, patients):
 
 def documents_page(patient_id, editable=True):
 
-    # ==========================================================
-    # DEBUG
-    # ==========================================================
-
-    st.error("New document_page CODE IS RUNNING")
-    st.write("documents_page reached successfully")
 
     # ==========================================================
     # IMPORTS
@@ -5652,31 +5675,40 @@ def alerts_page(patient_id):
         return
 
     # ==========================================================
-    # GET LATEST AI ANALYSIS
+    # GET LATEST AI ANALYSIS & ALERTS
     # ==========================================================
 
     documents = patient.get("documents", [])
 
-    analysis_data = None
+    alerts = []
+    seen_msgs = set()
 
     for document in reversed(documents):
+        d_alerts = []
+        if isinstance(document.get("analysis_data"), dict) and document["analysis_data"].get("alerts"):
+            d_alerts = document["analysis_data"]["alerts"]
+        elif document.get("alerts") and isinstance(document.get("alerts"), list):
+            d_alerts = document["alerts"]
 
-        data = document.get("analysis_data")
+        for a in d_alerts:
+            msg = a if isinstance(a, str) else (a.get("message") if isinstance(a, dict) else str(a))
+            if msg and msg not in seen_msgs:
+                seen_msgs.add(msg)
+                alerts.append(a)
 
-        if isinstance(data, dict) and (
-            data.get("alerts")
-            or data.get("overall_summary")
-            or data.get("patterns")
-        ):
-            analysis_data = data
-            break
+    if not alerts and patient.get("alerts") and isinstance(patient.get("alerts"), list):
+        for a in patient.get("alerts"):
+            msg = a if isinstance(a, str) else (a.get("message") if isinstance(a, dict) else str(a))
+            if msg and msg not in seen_msgs:
+                seen_msgs.add(msg)
+                alerts.append(a)
 
     # ==========================================================
     # PAGE HEADER
     # ==========================================================
 
     st.markdown(
-        '<div class="mp-card"><h4>🚨 Alerts</h4>',
+        f'<div class="mp-card"><h4>🚨 Alerts — {patient.get("name", "Patient")} ({patient_id})</h4>',
         unsafe_allow_html=True,
     )
 
@@ -5685,10 +5717,10 @@ def alerts_page(patient_id):
         "the documented patient information."
     )
 
-    if not analysis_data:
+    if not alerts:
 
         empty_state(
-            "No AI-generated alerts available yet."
+            "No alerts"
         )
 
         st.markdown(
@@ -5697,15 +5729,6 @@ def alerts_page(patient_id):
         )
 
         return
-
-    # ==========================================================
-    # ALERTS
-    # ==========================================================
-
-    alerts = analysis_data.get(
-        "alerts",
-        []
-    )
 
     if alerts:
 
@@ -8888,7 +8911,6 @@ NAV = {
         "Add Patient",
         "Search Patient",
         "Documents",
-        "Follow-ups",
         "Notes",
         "Timeline",
         "Alerts",
@@ -8912,6 +8934,9 @@ def sidebar_nav():
         "chw": "CHW"
     }.get(role, role)
 
+    curr_page = st.session_state.get("page", "Dashboard")
+    curr_page_lower = curr_page.strip().lower() if curr_page else "dashboard"
+
     with st.sidebar:
 
         render_logo()
@@ -8926,11 +8951,13 @@ def sidebar_nav():
             role_display,
             []
         ):
+            is_active = (item.strip().lower() == curr_page_lower)
 
             if st.button(
                 item,
                 key=f"nav_{item}",
-                use_container_width=True
+                use_container_width=True,
+                type="primary" if is_active else "secondary"
             ):
 
                 st.session_state.page = item
@@ -8948,7 +8975,7 @@ def sidebar_nav():
 
             st.rerun()
 
-    render_chatbot()
+
 
 # ==============================================================
 # PATIENT ROUTER
@@ -9173,10 +9200,161 @@ def doctor_notes_page(user):
     else:
         st.info("No saved notes for this patient yet.")
 
+    # ==========================================================
+    # PATIENT-AWARE AI CHAT ASSISTANT SECTION
+    # ==========================================================
+    st.markdown("---")
+    st.markdown(f"### 🤖 Chat with MedPath AI — Patient: {patient.get('name', 'Patient')} ({selected_patient_id})")
+    st.caption("Ask questions, request summaries, or verify clinical evidence grounded strictly in this patient's record.")
+
+    # Initialize per-patient chat history
+    if "doctor_patient_chat_history" not in st.session_state:
+        st.session_state["doctor_patient_chat_history"] = {}
+
+    patient_chat_history = st.session_state["doctor_patient_chat_history"].setdefault(selected_patient_id, [])
+
+    # Header action: Clear Chat
+    c_chat_header, c_clear_btn = st.columns([4, 1])
+    with c_clear_btn:
+        if st.button("🗑️ Clear Chat", key=f"clear_chat_{selected_patient_id}"):
+            st.session_state["doctor_patient_chat_history"][selected_patient_id] = []
+            st.rerun()
+
+    # Chat history display container
+    chat_container = st.container()
+    with chat_container:
+        if not patient_chat_history:
+            st.markdown(
+                f"""
+                <div style="
+                    background: #F1F5F9;
+                    border: 1px dashed #CBD5E1;
+                    border-radius: 8px;
+                    padding: 20px;
+                    text-align: center;
+                    color: #64748B;
+                    margin-bottom: 16px;
+                ">
+                    💬 No messages yet for {patient.get('name', 'this patient')}. Try asking:
+                    <br><br>
+                    <i>• "hemoglobin" or "Hb" — exact lab value</i><br>
+                    <i>• "CBC" — full blood count panel</i><br>
+                    <i>• "platelet count" — shows all documented values &amp; sources</i><br>
+                    <i>• "symptoms" — all documented symptoms</i><br>
+                    <i>• "medications"</i><br>
+                    <i>• "Does this patient have anemia?" — clinical interpretation</i><br>
+                    <i>• "What is anemia?" — medical knowledge</i><br>
+                    <i>• "summary" — clinical overview</i>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+        else:
+            for msg in patient_chat_history:
+                role = msg.get("role")
+                content = msg.get("content", "")
+                ts = msg.get("timestamp", "")
+                
+                if role == "user":
+                    with st.chat_message("user"):
+                        st.markdown(content)
+                        if ts:
+                            st.caption(f"Sent at {ts}")
+                else:
+                    with st.chat_message("assistant", avatar="🤖"):
+                        if content and content.strip():
+                            st.markdown(content)
+                        else:
+                            st.warning("No answer text returned.")
+                        if ts:
+                            st.caption(f"MedPath AI • {ts}")
+
+    # Chat Input Box
+    st.markdown("#### Ask MedPath AI")
+    
+    # Store draft question in session state
+    draft_key = f"chat_draft_input_{selected_patient_id}"
+    if draft_key not in st.session_state:
+        st.session_state[draft_key] = ""
+
+    # Check for retry trigger
+    retry_key = f"chat_retry_trigger_{selected_patient_id}"
+    if st.session_state.get(retry_key):
+        st.session_state[draft_key] = st.session_state.pop(retry_key)
+
+    with st.form(key=f"patient_chat_form_{selected_patient_id}", clear_on_submit=False):
+        user_question = st.text_input(
+            label="Type your question about this patient",
+            value=st.session_state[draft_key],
+            placeholder=f"e.g. 'hemoglobin', 'platelet count', 'CBC', 'symptoms', 'Does this patient have anemia?', 'summary'...",
+            key=f"input_field_{selected_patient_id}"
+        )
+        
+        c_send, c_dummy = st.columns([1, 4])
+        with c_send:
+            submitted = st.form_submit_button("📨 Send", type="primary")
+
+    if submitted and user_question.strip():
+        now_time = datetime.now().strftime("%H:%M:%S")
+        question_text = user_question.strip()
+        
+        # Add user message to history
+        patient_chat_history.append({
+            "role": "user",
+            "content": question_text,
+            "timestamp": now_time
+        })
+        st.session_state[draft_key] = ""
+
+        # Call backend API
+        with st.spinner("🤖 MedPath AI is analyzing patient record..."):
+            payload = {
+                "patient_id": selected_patient_id,
+                "question": question_text,
+                "conversation_history": [
+                    {"role": m["role"], "content": m["content"]}
+                    for m in patient_chat_history[:-1]
+                ]
+            }
+            res = send_patient_chat(selected_patient_id, payload)
+            
+            if res and hasattr(res, "status_code") and res.status_code == 200:
+                answer = res.json().get("answer", "").strip() if hasattr(res, "json") else ""
+                if not answer:
+                    answer = "That information is not documented in this patient's record."
+                
+                patient_chat_history.append({
+                    "role": "assistant",
+                    "content": answer,
+                    "timestamp": datetime.now().strftime("%H:%M:%S")
+                })
+                st.session_state["doctor_patient_chat_history"][selected_patient_id] = patient_chat_history
+                st.rerun()
+            else:
+                err_detail = "Unknown connection error"
+                if res and hasattr(res, "json"):
+                    try:
+                        err_detail = res.json().get("detail", res.text)
+                    except Exception:
+                        err_detail = getattr(res, "text", str(res))
+                elif res and hasattr(res, "text"):
+                    err_detail = res.text
+
+                # Pop user message so it isn't orphaned
+                patient_chat_history.pop()
+                st.session_state[draft_key] = question_text
+                
+                st.error(f"AI analysis failed: {err_detail}")
+                if st.button("🔄 Retry Question", key=f"retry_btn_{selected_patient_id}"):
+                    st.session_state[retry_key] = question_text
+                    st.rerun()
+
+
 
 # ==============================================================
 # DOCTOR ROUTER
 # ==============================================================
+
 
 def route_doctor(
     page,
@@ -9347,6 +9525,131 @@ def route_doctor(
 
 
 # ==============================================================
+# CHW NOTES PAGE
+# ==============================================================
+
+def chw_notes_page(user):
+    st.markdown("## 📝 CHW Notes")
+    st.caption("Record and review clinical notes for the selected patient.")
+
+    patients = load_db(PATIENTS_FILE)
+    if not patients:
+        empty_state("No patients available in the system.")
+        return
+
+    patient_options = {}
+    for pid, p in patients.items():
+        pname = p.get("name", "Unknown Patient")
+        label = f"{pname} ({pid})"
+        patient_options[label] = pid
+
+    curr_pid = st.session_state.get("selected_patient_id")
+    curr_index = 0
+    if curr_pid and curr_pid in patients:
+        for idx, (lbl, pid) in enumerate(patient_options.items()):
+            if pid == curr_pid:
+                curr_index = idx
+                break
+
+    selected_label = st.selectbox(
+        "Select Patient",
+        options=list(patient_options.keys()),
+        index=curr_index,
+        key="chw_notes_patient_selector"
+    )
+
+    selected_patient_id = patient_options[selected_label]
+    st.session_state["selected_patient_id"] = selected_patient_id
+    patient = patients.get(selected_patient_id, {})
+
+    st.markdown(f"### 👤 {patient.get('name', 'Patient')}")
+    st.caption(f"Patient ID: {selected_patient_id}")
+
+    st.markdown("#### ✏️ Clinical Note")
+    note_input_key = f"chw_clinical_note_input_{selected_patient_id}"
+    clinical_note_text = st.text_area(
+        label="Clinical Note",
+        label_visibility="collapsed",
+        placeholder="Enter clinical observations, assessment, follow-up plan, treatment notes, or other relevant information...",
+        height=140,
+        key=note_input_key
+    )
+
+    if st.button("💾 Save Notes", key=f"btn_save_chw_notes_{selected_patient_id}"):
+        if clinical_note_text.strip():
+            author_name = user.get("full_name") or user.get("name") or user.get("email") or "CHW"
+            now_iso = datetime.now().isoformat()
+
+            new_note = {
+                "id": str(uuid.uuid4())[:8],
+                "text": clinical_note_text.strip(),
+                "author": author_name,
+                "created_at": now_iso
+            }
+
+            if "doctor_notes_history" not in patient or not isinstance(patient["doctor_notes_history"], list):
+                patient["doctor_notes_history"] = []
+
+            # Migrate any legacy single doctor_notes string
+            if patient.get("doctor_notes") and not patient["doctor_notes_history"]:
+                patient["doctor_notes_history"].append({
+                    "id": "legacy_note",
+                    "text": patient["doctor_notes"],
+                    "author": author_name,
+                    "created_at": patient.get("createdAt", now_iso)
+                })
+
+            patient["doctor_notes_history"].insert(0, new_note)
+            patient["doctor_notes"] = clinical_note_text.strip()
+            patients[selected_patient_id] = patient
+            save_db(PATIENTS_FILE, patients)
+
+            st.success("Clinical note saved successfully!")
+            st.rerun()
+        else:
+            st.warning("Please enter some clinical notes before saving.")
+
+    st.markdown("---")
+    st.markdown("#### 📌 Saved Notes")
+
+    notes_history = patient.get("doctor_notes_history", [])
+    if not notes_history and patient.get("doctor_notes"):
+        notes_history = [{
+            "id": "legacy_note",
+            "text": patient.get("doctor_notes"),
+            "author": "Clinical Staff",
+            "created_at": patient.get("createdAt", datetime.now().isoformat())
+        }]
+
+    if notes_history:
+        for note in notes_history:
+            text_content = note.get("text", "")
+            author = note.get("author", "Clinical Staff")
+            created_at = note.get("created_at", "")
+
+            st.markdown(
+                f"""
+                <div style="
+                    background: #F8FAFC;
+                    border: 1px solid #E2E8F0;
+                    border-radius: 8px;
+                    padding: 16px 18px;
+                    margin-bottom: 12px;
+                ">
+                    <div style="font-size: 14px; color: #1E293B; margin-bottom: 10px; line-height: 1.5; white-space: pre-wrap;">{text_content}</div>
+                    <div style="display: flex; justify-content: space-between; font-size: 12px; color: #64748B; border-top: 1px solid #EDF2F7; padding-top: 8px;">
+                        <span>👤 <b>Saved by:</b> {author}</span>
+                        <span>🕒 <b>Last updated:</b> {created_at}</span>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+    else:
+        st.info("No saved notes for this patient yet.")
+
+
+# ==============================================================
 # CHW ROUTER
 # ==============================================================
 
@@ -9375,18 +9678,28 @@ def route_chw(
             options[f"{p_rec.get('name', 'Unknown')} ({p_id})"] = p_id
 
         if options:
+            curr_pid = st.session_state.get("selected_patient_id")
+            curr_idx = 0
+            if curr_pid and curr_pid in patients:
+                for idx, (lbl, pid) in enumerate(options.items()):
+                    if pid == curr_pid:
+                        curr_idx = idx
+                        break
+
             choice = st.selectbox(
                 "Select Patient for Evidence Graph",
-                list(options.keys())
+                list(options.keys()),
+                index=curr_idx,
+                key="chw_graph_patient_selector"
             )
             sel_pid = options[choice]
+            st.session_state["selected_patient_id"] = sel_pid
             render_clinical_evidence_graph_page(
                 sel_pid,
                 patients[sel_pid]
             )
         else:
             empty_state("No patients assigned yet.")
-
 
     elif page == "Add Patient":
 
@@ -9408,14 +9721,24 @@ def route_chw(
             ] = patient_id
 
         if options:
+            curr_pid = st.session_state.get("selected_patient_id")
+            curr_idx = 0
+            if curr_pid and curr_pid in patients:
+                for idx, (lbl, pid) in enumerate(options.items()):
+                    if pid == curr_pid:
+                        curr_idx = idx
+                        break
 
             choice = st.selectbox(
                 "Select Patient",
                 list(options.keys()),
+                index=curr_idx,
+                key="chw_docs_patient_selector"
             )
-
+            sel_pid = options[choice]
+            st.session_state["selected_patient_id"] = sel_pid
             documents_page(
-                options[choice]
+                sel_pid
             )
 
         else:
@@ -9424,26 +9747,10 @@ def route_chw(
                 "No patients assigned yet."
             )
 
-    elif page == "Follow-ups":
-
-        chw_dashboard_page(
-            user
-        )
-
     elif page == "Notes":
 
-        st.markdown(
-            '<div class="mp-card"><h4>Notes</h4>',
-            unsafe_allow_html=True,
-        )
-
-        empty_state(
-            "No notes recorded yet."
-        )
-
-        st.markdown(
-            "</div>",
-            unsafe_allow_html=True,
+        chw_notes_page(
+            user
         )
 
     elif page == "Timeline":
@@ -9462,14 +9769,24 @@ def route_chw(
             ] = patient_id
 
         if options:
+            curr_pid = st.session_state.get("selected_patient_id")
+            curr_idx = 0
+            if curr_pid and curr_pid in patients:
+                for idx, (lbl, pid) in enumerate(options.items()):
+                    if pid == curr_pid:
+                        curr_idx = idx
+                        break
 
             choice = st.selectbox(
                 "Select Patient",
                 list(options.keys()),
+                index=curr_idx,
+                key="chw_timeline_patient_selector"
             )
-
+            sel_pid = options[choice]
+            st.session_state["selected_patient_id"] = sel_pid
             timeline_page(
-                options[choice]
+                sel_pid
             )
 
         else:
@@ -9480,19 +9797,45 @@ def route_chw(
 
     elif page == "Alerts":
 
-        st.markdown(
-            '<div class="mp-card"><h4>Alerts</h4>',
-            unsafe_allow_html=True,
+        patients = load_db(
+            PATIENTS_FILE
         )
 
-        empty_state(
-            "No alerts"
-        )
+        options = {}
 
-        st.markdown(
-            "</div>",
-            unsafe_allow_html=True,
-        )
+        for patient_id, patient in patients.items():
+
+            options[
+                f"{patient.get('name', 'Unknown')} "
+                f"({patient_id})"
+            ] = patient_id
+
+        if options:
+            curr_pid = st.session_state.get("selected_patient_id")
+            curr_idx = 0
+            if curr_pid and curr_pid in patients:
+                for idx, (lbl, pid) in enumerate(options.items()):
+                    if pid == curr_pid:
+                        curr_idx = idx
+                        break
+
+            choice = st.selectbox(
+                "Select Patient",
+                list(options.keys()),
+                index=curr_idx,
+                key="chw_alerts_patient_selector"
+            )
+            sel_pid = options[choice]
+            st.session_state["selected_patient_id"] = sel_pid
+            alerts_page(
+                sel_pid
+            )
+
+        else:
+
+            empty_state(
+                "No patients assigned yet."
+            )
 
     elif page == "Profile":
 

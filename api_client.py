@@ -264,3 +264,16 @@ def ingest_patient_evidence(patient_id: str, payload: dict):
     return _post(f"/patients/{patient_id}/evidence/ingest", payload)
 
 
+# ============================================================
+# PATIENT-AWARE AI CHAT
+# ============================================================
+
+def send_patient_chat(patient_id: str, chat_data: dict):
+    if not patient_id:
+        return _error_response("Patient ID is required.", status_code=400)
+    if isinstance(chat_data, dict) and "patient_id" not in chat_data:
+        chat_data["patient_id"] = patient_id
+    return _post(f"/patients/{patient_id}/chat", chat_data)
+
+
+
